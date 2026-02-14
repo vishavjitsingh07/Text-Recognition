@@ -464,6 +464,65 @@ For Stable Diffusion v1.5:
 So `encoder_hidden_states` is typically shaped like:
 - **(B, L, 768)** → e.g., **(1, 77, 768)**
 
+### 4.1.5 UNet denoiser architecture (what the UNet “is”)
+The UNet used in Stable Diffusion is a **multi‑scale encoder–decoder** network with skip connections:
+- **Down blocks**: progressively reduce spatial resolution and increase channels (extract features).
+- **Mid block**: processes the smallest-resolution features (often includes attention).
+- **Up blocks**: progressively increase resolution while merging skip connections from down blocks.
+- **Cross‑attention blocks**: inserted at multiple resolutions so the model can condition image features on the text embeddings.
+
+You can think of it like this (high level):
+
+```text
+noisy_latents z_t (B,4,64,64)
+   │ + time embedding(t)
+   ▼
+[Down blocks: ResNet + (Self/Cross-Attn)]  ──┐  (skip connections)
+   ▼                                        │
+[Mid block: ResNet + Attn]                  │
+   ▼                                        │
+[Up blocks: ResNet + (Self/Cross-Attn)]  ◀──┘
+   ▼
+predicted_noise εθ (B,4,64,64)
+```
+
+**Why this architecture is appropriate**
+- The UNet can model both **global layout** (where text should go) and **local details** (stroke shapes).
+- Skip connections help keep fine details (important for readable text).
+
+### 4.1.6 Noise scheduler (DDPM) — the numerics behind timesteps
+Diffusion defines a sequence of noise levels using \(\beta_t\) (noise variance schedule):
+- \(\alpha_t = 1 - \beta_t\)
+- \(\bar{\alpha}_t = \prod_{i=1}^{t}\alpha_i\)
+
+Forward process (corrupting a clean latent \(z_0\)):
+\[
+z_t=\sqrt{\bar{\alpha}_t}z_0 + \sqrt{1-\bar{\alpha}_t}\epsilon,\quad \epsilon\sim\mathcal{N}(0,I)
+\]
+
+In the notebook:
+- \(t\) is sampled uniformly as an integer timestep (often total timesteps ≈ 1000 in SD schedulers).
+- `noise_scheduler.add_noise(latents, noise, timesteps)` implements the equation above.
+
+Reverse process (sampling / generation):
+- Start from pure noise \(z_T\sim \mathcal{N}(0,I)\)
+- For \(t = T \rightarrow 0\), repeatedly:
+  - predict noise with UNet: \(\epsilon_\theta(z_t,t,c)\)
+  - scheduler computes the next latent \(z_{t-1}\)
+
+<details>
+<summary><b>Click: inference algorithm pseudocode (how an image is generated)</b></summary>
+
+```text
+z_T ~ Normal(0, I)
+for t = T ... 1:
+  eps = UNet(z_t, t, text_embeddings)
+  z_{t-1} = scheduler.step(eps, t, z_t)
+image = VAE.decode(z_0)
+```
+
+</details>
+
 ### 4.2 LoRA configuration (what is trained)
 The notebook freezes all base parameters and trains only LoRA adapters on the UNet attention modules:
 - **Target modules**: `["to_k", "to_q", "to_v", "to_out.0"]`
@@ -517,17 +576,46 @@ Here:
 
 This means the adapter update magnitude is in a reasonable range relative to the base weights.
 
+### 4.2.5 Rank/alpha trade-offs (how to tune LoRA intelligently)
+This is the simplest tuning intuition:
+- **Rank \(r\)** controls *capacity* (how much the adapter can change the model).
+  - Higher \(r\) → more trainable parameters → can learn sharper text, but increases VRAM/time and overfitting risk.
+  - Lower \(r\) → very efficient, but may underfit text spelling details.
+- **Alpha \(\alpha\)** controls *update scale* relative to rank (roughly \(\alpha/r\)).
+  - If \(\alpha/r\) is large, updates can be strong (sometimes unstable unless LR is reduced).
+  - If \(\alpha/r\) is small, updates may be too weak (may under-adapt).
+
+**Practical tuning suggestion (exam-ready):**
+- First try increasing \(r\) (4 → 8) while keeping \(\alpha/r\) ≈ 1 (e.g., \(\alpha=8\)).
+- If training becomes unstable, reduce LR (e.g., 1e-4 → 5e-5).
+
 ### 4.3 Device and precision
 - Device: CUDA if available
 - Mixed precision: fp16 on GPU (VAE and Text Encoder are cast to fp16; UNet handled by `accelerate`)
 
 ### 4.4 Improvements (model-side)
-If we want stronger text correctness:
-- Increase **LoRA rank** (e.g., 8 or 16) if VRAM allows.
-- Apply LoRA to additional UNet blocks (not only attention projections).
-- Try LoRA on the **text encoder** as well (adapts prompt understanding).
-- Train at higher resolution (768) for sharper characters (requires more VRAM).
-- Add OCR-guided or recognition-guided training (multi-task idea).
+Below is a more detailed improvement scope with **theory**, **expected impact**, and **trade-offs**.
+
+| Improvement | Why it helps (theory) | Expected effect | Cost / trade-off |
+|---|---|---|---|
+| Increase LoRA rank (4 → 8/16) | More adapter capacity in attention projections → better text conditioning | Higher character clarity + potentially better OCR | More VRAM + time; overfitting risk with tiny data |
+| Expand target modules / layers | Adapts more of UNet, not only attention projections | Stronger domain shift adaptation | More parameters; may need more data |
+| LoRA on text encoder | Adapts prompt embeddings → better mapping from words to strokes | Better prompt-text alignment | Risk: overfit prompt style; needs careful LR |
+| Higher resolution training (512 → 768) | More pixels per character; latent becomes larger (96×96) | Sharper characters | Much higher VRAM/time |
+| OCR-guided (multi‑task) training | Adds recognition objective (forces spelling correctness) | Biggest expected OCR jump | Requires additional model + more code complexity |
+| OCR‑based selection (no training) | Generate N candidates and keep best OCR score | Improves measured OCR without retraining | Slower inference (N×) |
+
+<details>
+<summary><b>Click: OCR-guided training idea (how it works conceptually)</b></summary>
+
+1. Generate image with SD (fine-tuned or base).
+2. Run an OCR/recognition model (e.g., TrOCR/CRNN) to predict text.
+3. Compute a loss between predicted text and ground truth (cross-entropy / edit-distance proxy).
+4. Backprop into LoRA adapters (or use reinforcement/gradient estimators if OCR is non-differentiable).
+
+**Why it helps:** it turns the task into a multi-task system: image realism + text correctness.
+
+</details>
 
 ---
 
@@ -943,6 +1031,38 @@ Main factors:
   - longer training
   - hyperparameter tuning (rank/alpha, LR, resolution, inference steps)
 
+### 11.1 Improvement Roadmap (detailed, with theory + “what to change”)
+This is a practical plan that a professor can use to see you understand *how to improve* the system.
+
+#### Quick wins (no retraining)
+| Change | Where to change | Why it helps | Expected impact |
+|---|---|---|---|
+| Generate 5 images per prompt and pick best by OCR | In evaluation: loop N times per prompt | OCR is noisy; best-of-N increases chance of readable text | Higher measured OCR, slower inference |
+| Tune CFG guidance scale (e.g., 5.0, 7.5, 9.0) | `config.GUIDANCE_SCALE` | Too high CFG can distort letters; too low ignores prompt | Can improve readability at same model |
+| Increase inference steps (50 → 75/100) for final results | `config.INFERENCE_STEPS` | More denoising steps reduces artifacts | Higher quality, slower sampling |
+
+#### Data improvements (most important for text)
+| Change | Where to change | Why it helps (theory) | Expected impact |
+|---|---|---|---|
+| Increase dataset size (50 → 5k+) | `NUM_TRAINING_SAMPLES` | More examples reduce underfitting and improve character learning | Stronger generalization + higher OCR |
+| Add more fonts and weights | generator font selection | Model learns invariant character shapes across fonts | Better OCR robustness |
+| Add perspective/blur/compression | generator augmentations | Matches real photo distortions; reduces domain gap | Better real-world performance |
+
+#### Model/training improvements (capacity + stability)
+| Change | Where to change | Why it helps | Expected impact |
+|---|---|---|---|
+| Increase LoRA rank (4 → 8) | `LORA_RANK`, `LORA_ALPHA` | More adapter capacity | Better adaptation, more VRAM |
+| Train longer with more data | `NUM_EPOCHS` | More optimization steps after data scale-up | Higher quality, risk overfit if data still small |
+| LoRA on text encoder | apply PEFT to text encoder too | Better prompt embedding alignment | Better spelling alignment, needs tuning |
+
+#### Evaluation improvements (better scoring + proof)
+| Change | Why it helps | Notes |
+|---|---|---|
+| Add CER/WER (edit distance) | standard OCR evaluation | stronger than zip-based accuracy |
+| Track OCR confidence + speed | matches rubric “speed/metrics” | add mean inference time per image |
+
+> **Exam tip**: If asked “what would you do next?”, pick one improvement from each category and justify with theory.
+
 ---
 
 ## 12. References
@@ -993,6 +1113,713 @@ Goal: a professor can quickly verify correctness, and a beginner can understand 
 
 > Important: the notebook is organized as “Markdown heading cell → Code cell”.  
 > Below, I treat each heading and its following code cell(s) as separate “cells”.
+
+### A0. Notebook Cell Index (65 cells) — click to expand
+
+<details>
+<summary><b>Cell index table (Cell 000 → Cell 064)</b></summary>
+
+| Cell | Type | Notebook heading / first line | Main output / purpose |
+|---:|---|---|---|
+| 000 | markdown | Assignment 2: Fine-Tuning a Text-to-Image Model Using Crowd-Sourced Text–Image Pairs | Title + intro + ToC |
+| 001 | markdown | 2. Environment Setup | Section heading |
+| 002 | code | import torch | GPU/CUDA availability + device info print |
+| 003 | markdown | 2.2 Install Required Libraries | Install section heading |
+| 004 | code | %%capture | Installs Python packages + system Tesseract |
+| 005 | markdown | 2.3 Import Libraries | Import section heading |
+| 006 | code | %%capture | Imports all training/OCR/plotting libraries |
+| 007 | markdown | 2.4 Set Random Seeds for Reproducibility | Reproducibility heading |
+| 008 | code | def set_seed(seed: int = 42): | Sets random seeds + deterministic flags |
+| 009 | markdown | 2.5 Configuration and Hyperparameters | Config heading |
+| 010 | code | class Config: | Central hyperparameters + output folders |
+| 011 | markdown | 3. Data Preprocessing & Augmentation | Data section heading |
+| 012 | code | class TextImageGenerator: | Synthetic text-image generator |
+| 013 | markdown | 3.2 Create Training and Validation Datasets | Split heading |
+| 014 | code | # Initialize generator | Generate 50 train + 10 val samples |
+| 015 | markdown | 3.3 Save Dataset to Disk | Save heading |
+| 016 | code | def save_dataset(dataset: List[Dict], split: str = "train"): | Save images + metadata.json |
+| 017 | markdown | 3.4 Visualize Sample Images | Visualization heading |
+| 018 | code | def visualize_samples(dataset: List[Dict], num_samples: int = 6): | Save `outputs/dataset_samples.png` |
+| 019 | markdown | 3.5 Custom Dataset Class for PyTorch | Dataset heading |
+| 020 | code | class TextImageDataset(Dataset): | Preprocess tensors + tokenize prompts |
+| 021 | markdown | 4. Model Development | Model section heading |
+| 022 | code | print(f"Loading Stable Diffusion model: {config.MODEL_ID}") | Load tokenizer, text encoder, VAE, UNet, scheduler |
+| 023 | markdown | 4.2 Configure LoRA for Fine-tuning | LoRA heading |
+| 024 | code | # Freeze all model parameters (we only want to train LoRA weights) | Freeze + apply LoRA adapters |
+| 025 | markdown | 4.3 Move Models to Device | Device heading |
+| 026 | code | # Move models to device | `.to(cuda)` + fp16 setup |
+| 027 | markdown | 5. Training | Training section heading |
+| 028 | code | # Create datasets | Dataloaders (train/val) |
+| 029 | markdown | 5.2 Setup Optimizer and Scheduler | Optim heading |
+| 030 | code | # Only optimize LoRA parameters | AdamW + LR scheduler |
+| 031 | markdown | 5.3 Initialize Accelerator for Mixed Precision Training | Accelerator heading |
+| 032 | code | # Initialize accelerator | `Accelerator()` prepare |
+| 033 | markdown | 5.4 Training Loop | Loop heading |
+| 034 | code | def train_one_epoch( | Core diffusion training function |
+| 035 | markdown | 5.5 Execute Training | Run heading |
+| 036 | code | # Training history | Run epochs + save best/checkpoints |
+| 037 | markdown | 5.6 Plot Training Curves | Plot heading |
+| 038 | code | def plot_training_curves(history: Dict): | Save `outputs/training_curves.png` |
+| 039 | markdown | 6. Evaluation Metrics | Evaluation heading |
+| 040 | code | # Load the complete pipeline with LoRA weights | Load pipeline + load adapter |
+| 041 | markdown | 6.2 Generate Images for Evaluation | Generation heading |
+| 042 | code | def generate_images(pipeline, prompts: List[str], ...) | Generate validation images |
+| 043 | markdown | 6.3 OCR-based Evaluation | OCR heading |
+| 044 | code | def extract_text_from_image(image: Image.Image) -> str: | OCR preprocessing + metrics functions |
+| 045 | markdown | 6.4 Perform Evaluation on Generated Images | Eval run heading |
+| 046 | code | # Evaluate generated images | Run OCR + save CSV |
+| 047 | markdown | 6.5 Visualize Evaluation Results | Eval plot heading |
+| 048 | code | def visualize_evaluation_results(results_df: pd.DataFrame): | Save `outputs/evaluation_metrics.png` |
+| 049 | markdown | 7. Results & Analysis | Results heading |
+| 050 | code | def visualize_generated_images_with_ocr( | Save `outputs/generated_images_with_ocr.png` |
+| 051 | markdown | 7.2 Compare Before and After Fine-tuning | Comparison heading |
+| 052 | code | # Load base model without LoRA for comparison | Load base pipeline |
+| 053 | code | def visualize_before_after_comparison( | Save `outputs/before_after_comparison.png` |
+| 054 | markdown | 7.3 Qualitative Analysis | Qualitative heading |
+| 055 | code | print("=" * 70) | Prints qualitative analysis text |
+| 056 | markdown | 7.4 Save Final Summary Report | Report heading |
+| 057 | code | summary_report = f""" | Writes `outputs/summary_report.txt` |
+| 058 | markdown | 8. Conclusion | Conclusion heading |
+| 059 | code | print("="*70) | Prints completion summary + deliverables |
+| 060 | markdown | 8.2 Generate Test Images with Custom Prompts (Bonus) | Bonus heading |
+| 061 | code | # Generate some custom test images | Saves `outputs/custom_test_images.png` |
+| 062 | code | print("\\nTeam Member Contributions:\\n") | Prints contributions section |
+| 063 | code | from datetime import datetime | Timestamp helper import |
+| 064 | markdown | End of Assignment | End marker |
+
+</details>
+
+> **How to use this appendix**: press `Ctrl/Cmd + F` and search for `Cell 034`, `Cell 040`, etc.  
+> Each cell below is **collapsible** (click-to-expand) so the README stays readable but still detailed.
+
+### A0.1 Cell-by-cell explanations (click to expand)
+
+<details>
+<summary><b>Cell 000 (markdown)</b> — Assignment title + intro + ToC</summary>
+
+- **What this cell contains**: the assignment title, problem statement, objectives, and a table of contents.
+- **Why it exists**: establishes the report structure (important for grading and for readers).
+- **Theory connection**: explains “domain shift” and why LoRA + OCR are used in this task.
+
+</details>
+
+<details>
+<summary><b>Cell 001 (markdown)</b> — Section 2 heading (Environment Setup)</summary>
+
+- **Purpose**: separates the report into a clear “setup” phase before implementation.
+
+</details>
+
+<details>
+<summary><b>Cell 002 (code)</b> — GPU/CUDA availability check</summary>
+
+- **Goal**: verify training can run on GPU (and show the GPU model + memory).
+- **What the code does**:
+  - prints Python + PyTorch versions
+  - checks `torch.cuda.is_available()`
+  - prints CUDA version, GPU name, and VRAM
+- **Theory**:
+  - diffusion fine-tuning is compute/VRAM heavy; VRAM limits batch size/resolution.
+- **Expected output**: e.g., `CUDA Available: True`, `GPU Device: Tesla T4`, etc.
+
+</details>
+
+<details>
+<summary><b>Cell 003 (markdown)</b> — “Install Required Libraries” heading</summary>
+
+- **Purpose**: introduces the dependency installation step (so the notebook is reproducible).
+
+</details>
+
+<details>
+<summary><b>Cell 004 (code)</b> — Install packages + install Tesseract</summary>
+
+- **What it does**:
+  - installs `diffusers`, `transformers`, `accelerate`, `peft` (training stack)
+  - installs `pytesseract`, `opencv-python`, `pillow` (OCR + imaging)
+  - installs `bitsandbytes`, `xformers` (efficiency)
+  - pins `numpy==1.24.4` to avoid binary compatibility issues
+  - installs system OCR engine: `tesseract-ocr`
+- **Theory**:
+  - Python `pytesseract` is only a wrapper; system Tesseract is required for OCR.
+  - `peft` provides LoRA adapters; `accelerate` manages fp16 + accumulation.
+
+> **Exam tip**: “Why pin NumPy?” → binary compatibility errors are common in Colab; pinning stabilizes the environment.
+
+</details>
+
+<details>
+<summary><b>Cell 005 (markdown)</b> — “Import Libraries” heading</summary>
+
+- **Purpose**: separates “installation” from “imports” (clean notebook style).
+
+</details>
+
+<details>
+<summary><b>Cell 006 (code)</b> — Import training/OCR/plotting libraries</summary>
+
+- **What it does**: imports:
+  - PyTorch + DataLoader + transforms
+  - `diffusers` components (UNet, VAE, scheduler, pipeline)
+  - `peft` LoRA utilities
+  - OCR libraries (pytesseract + OpenCV)
+  - plotting (matplotlib)
+- **Theory**: SD training needs text encoder + UNet + VAE; OCR evaluation needs image preprocessing + Tesseract.
+
+</details>
+
+<details>
+<summary><b>Cell 007 (markdown)</b> — “Set Random Seeds” heading</summary>
+
+- **Purpose**: introduces reproducibility (important for exam submissions).
+
+</details>
+
+<details>
+<summary><b>Cell 008 (code)</b> — Set seeds (reproducibility)</summary>
+
+- **What it does**:
+  - sets seeds for `random`, NumPy, PyTorch (CPU + CUDA)
+  - sets deterministic cuDNN flags
+- **Theory**:
+  - diffusion generation is stochastic; fixed seeds make results more repeatable.
+- **Trade-off**: deterministic cuDNN may reduce speed slightly.
+
+</details>
+
+<details>
+<summary><b>Cell 009 (markdown)</b> — “Configuration and Hyperparameters” heading</summary>
+
+- **Purpose**: centralizes all numeric settings so the experiment is auditable.
+
+</details>
+
+<details>
+<summary><b>Cell 010 (code)</b> — `Config` class (all hyperparameters)</summary>
+
+- **What it defines (key values)**:
+  - base model: `runwayml/stable-diffusion-v1-5`
+  - resolution: 512
+  - LoRA: rank=4, alpha=4, target modules in attention
+  - training: batch=1, accum=4, epochs=20, LR=1e-4
+  - data: train=50, val=10
+  - inference: steps=50, guidance=7.5
+  - output folders: `./data`, `./outputs`, `./lora_weights`
+- **Theory**:
+  - batch=1 + accumulation=4 is a memory strategy for Colab.
+  - LoRA rank=4 is small but enables adaptation.
+
+</details>
+
+<details>
+<summary><b>Cell 011 (markdown)</b> — Section 3 heading (Data)</summary>
+
+- **Purpose**: begins dataset generation and preprocessing section.
+
+</details>
+
+<details>
+<summary><b>Cell 012 (code)</b> — `TextImageGenerator` (synthetic dataset generator)</summary>
+
+- **Goal**: simulate “crowd-sourced operational text images” using controlled randomness.
+- **What it generates**:
+  - 512×512 RGB images
+  - centered text (font size 40–80, if font exists)
+  - random background RGB in [0..255]
+  - contrasting text color (black/white by brightness)
+  - optional border + optional Gaussian noise \(\\mathcal{N}(0,5)\)
+- **Why (theory)**:
+  - variability helps generalization (domain shift simulation).
+  - style words in prompt (sign/label/badge) teach contextual domain.
+
+</details>
+
+<details>
+<summary><b>Cell 013 (markdown)</b> — “Create Training and Validation Datasets” heading</summary>
+
+- **Purpose**: introduces train/val split creation.
+
+</details>
+
+<details>
+<summary><b>Cell 014 (code)</b> — Generate 50 train + 10 val samples</summary>
+
+- **What it does**:
+  - creates generator with resolution 512
+  - runs `generate_dataset(50)` and `generate_dataset(10)`
+- **Theory**: small dataset demonstrates LoRA under limited-data conditions.
+- **Output**: in-memory lists of dicts used in later steps.
+
+</details>
+
+<details>
+<summary><b>Cell 015 (markdown)</b> — “Save Dataset to Disk” heading</summary>
+
+- **Purpose**: ensures dataset is stored and reproducible for grading.
+
+</details>
+
+<details>
+<summary><b>Cell 016 (code)</b> — Save images + `metadata.json`</summary>
+
+- **What it does**:
+  - saves images to `./data/<split>/images/{id:04d}.png`
+  - writes `./data/<split>/metadata.json` with `id,image_path,text,prompt`
+- **Why (theory)**:
+  - separates data from code; anyone can inspect the dataset without rerunning generation.
+
+</details>
+
+<details>
+<summary><b>Cell 017 (markdown)</b> — “Visualize Sample Images” heading</summary>
+
+- **Purpose**: prompts a sanity-check step before training.
+
+</details>
+
+<details>
+<summary><b>Cell 018 (code)</b> — Visualize dataset samples</summary>
+
+- **What it does**:
+  - plots sample train images in a grid
+  - saves `./outputs/dataset_samples.png`
+- **Why (theory)**:
+  - visual data inspection prevents training on bad/blank images.
+
+</details>
+
+<details>
+<summary><b>Cell 019 (markdown)</b> — “Custom Dataset Class for PyTorch” heading</summary>
+
+- **Purpose**: introduces the Dataset wrapper that feeds tensors to the model.
+
+</details>
+
+<details>
+<summary><b>Cell 020 (code)</b> — `TextImageDataset` (transforms + tokenization)</summary>
+
+- **What it does**:
+  - image → tensor (3,512,512)
+  - normalize to [-1,1] using: \(x_{norm} = 2\\cdot(pixel/255) - 1\)
+  - prompt → CLIP `input_ids` (typically length 77)
+- **Theory**:
+  - SD expects normalized images and tokenized prompts for text conditioning.
+
+</details>
+
+<details>
+<summary><b>Cell 021 (markdown)</b> — Section 4 heading (Model Development)</summary>
+
+- **Purpose**: begins SD loading + LoRA application.
+
+</details>
+
+<details>
+<summary><b>Cell 022 (code)</b> — Load SD components (tokenizer, text encoder, VAE, UNet, scheduler)</summary>
+
+- **What it does**: loads pretrained components from `runwayml/stable-diffusion-v1-5`.
+- **Theory (how SD works)**:
+  - CLIP encodes text → embeddings \(c\)
+  - VAE encodes image → latent \(z\)
+  - UNet predicts noise residual in latent space
+- **Numerics**:
+  - pixels: (B,3,512,512) → latents: (B,4,64,64) (downsample factor ~8)
+
+</details>
+
+<details>
+<summary><b>Cell 023 (markdown)</b> — “Configure LoRA” heading</summary>
+
+- **Purpose**: introduces parameter-efficient fine-tuning.
+
+</details>
+
+<details>
+<summary><b>Cell 024 (code)</b> — Freeze base + apply LoRA adapters</summary>
+
+- **What it does**:
+  - freezes VAE + text encoder + UNet base
+  - applies LoRA to `to_q,to_k,to_v,to_out.0`
+  - prints trainable params (797,184) and percent (~0.0927%)
+- **Theory**:
+  - these modules implement cross-attention projections; adapting them changes prompt-image alignment.
+
+</details>
+
+<details>
+<summary><b>Cell 025 (markdown)</b> — “Move Models to Device” heading</summary>
+
+- **Purpose**: prepares models for GPU + mixed precision.
+
+</details>
+
+<details>
+<summary><b>Cell 026 (code)</b> — Move models to CUDA + fp16 setup</summary>
+
+- **What it does**:
+  - `.to(cuda)` for VAE/text encoder/UNet
+  - casts VAE + text encoder to float16 (fp16)
+  - sets eval mode for frozen parts, train mode for UNet
+- **Theory**: fp16 reduces VRAM and speeds up training on Colab GPUs.
+
+</details>
+
+<details>
+<summary><b>Cell 027 (markdown)</b> — Section 5 heading (Training)</summary>
+
+- **Purpose**: begins the training pipeline section.
+
+</details>
+
+<details>
+<summary><b>Cell 028 (code)</b> — Create DataLoaders</summary>
+
+- **What it does**:
+  - wraps lists into `TextImageDataset`
+  - makes train loader (shuffle) and val loader
+  - prints batch counts (50 train, 10 val)
+- **Theory**:
+  - each epoch processes all train samples once (batch size 1).
+
+</details>
+
+<details>
+<summary><b>Cell 029 (markdown)</b> — “Setup Optimizer and Scheduler” heading</summary>
+
+- **Purpose**: introduces optimization configuration for LoRA parameters only.
+
+</details>
+
+<details>
+<summary><b>Cell 030 (code)</b> — AdamW + LR scheduler (LoRA params only)</summary>
+
+- **What it does**:
+  - filters trainable parameters (LoRA)
+  - sets AdamW with weight decay
+  - configures scheduler (constant_with_warmup)
+- **Theory**: AdamW is standard for diffusion fine-tuning; scheduler stabilizes LR.
+
+</details>
+
+<details>
+<summary><b>Cell 031 (markdown)</b> — “Initialize Accelerator” heading</summary>
+
+- **Purpose**: introduces mixed precision + gradient accumulation support.
+
+</details>
+
+<details>
+<summary><b>Cell 032 (code)</b> — `Accelerator()` prepare</summary>
+
+- **What it does**:
+  - sets `gradient_accumulation_steps=4`
+  - sets mixed precision mode (fp16 if CUDA)
+  - wraps UNet/optimizer/dataloader/scheduler
+- **Theory**:
+  - accumulation simulates batch size 4 without VRAM of batch 4.
+
+</details>
+
+<details>
+<summary><b>Cell 033 (markdown)</b> — “Training Loop” heading</summary>
+
+- **Purpose**: introduces the main diffusion training function.
+
+</details>
+
+<details>
+<summary><b>Cell 034 (code)</b> — `train_one_epoch(...)` (core diffusion training)</summary>
+
+- **What it does (step-by-step)**:
+  1. VAE encodes image → latents (B,4,64,64)
+  2. sample noise + timestep \(t\)
+  3. add noise: \(z_t = \\sqrt{\\bar\\alpha_t}z_0 + \\sqrt{1-\\bar\\alpha_t}\\epsilon\)
+  4. get CLIP text embeddings (B,77,768)
+  5. UNet predicts noise residual
+  6. compute MSE loss and backprop through LoRA
+- **Why it works (theory)**:
+  - diffusion training teaches the UNet to denoise conditioned on prompt embeddings.
+- **Numerics**:
+  - timesteps sampled from `[0, num_train_timesteps)` (often 1000)
+
+```text
+LOSS = MSE(model_pred, target_noise)
+target_noise = noise  (epsilon prediction case)
+```
+
+</details>
+
+<details>
+<summary><b>Cell 035 (markdown)</b> — “Execute Training” heading</summary>
+
+- **Purpose**: introduces the actual training run and checkpointing logic.
+
+</details>
+
+<details>
+<summary><b>Cell 036 (code)</b> — Run epochs + save best model/checkpoints</summary>
+
+- **What it does**:
+  - runs 20 epochs
+  - tracks loss + learning rate history
+  - saves best LoRA adapter to `./lora_weights/best_model`
+  - checkpoints every 10 epochs
+  - cleans memory periodically
+- **Theory**:
+  - “best model” saving prevents losing the best adapter if later epochs degrade.
+
+</details>
+
+<details>
+<summary><b>Cell 037 (markdown)</b> — “Plot Training Curves” heading</summary>
+
+- **Purpose**: introduces visual proof of training convergence.
+
+</details>
+
+<details>
+<summary><b>Cell 038 (code)</b> — Plot loss + LR curves</summary>
+
+- **What it does**:
+  - plots training loss and learning rate over epochs
+  - saves `./outputs/training_curves.png`
+- **Theory**:
+  - decreasing loss indicates learning; spikes indicate instability.
+
+</details>
+
+<details>
+<summary><b>Cell 039 (markdown)</b> — Section 6 heading (Evaluation Metrics)</summary>
+
+- **Purpose**: begins inference + OCR evaluation.
+
+</details>
+
+<details>
+<summary><b>Cell 040 (code)</b> — Load pipeline + load LoRA adapter for inference</summary>
+
+- **What it does**:
+  - loads base StableDiffusionPipeline
+  - loads UNet and attaches LoRA adapter weights from `./lora_weights/best_model`
+  - disables safety checker for simplicity
+- **Theory**:
+  - inference uses the same SD components, but UNet attention is adapted by LoRA.
+
+</details>
+
+<details>
+<summary><b>Cell 041 (markdown)</b> — “Generate Images for Evaluation” heading</summary>
+
+- **Purpose**: introduces sample generation for validation prompts.
+
+</details>
+
+<details>
+<summary><b>Cell 042 (code)</b> — `generate_images(...)` (validation generation)</summary>
+
+- **What it does**:
+  - generates images for val prompts
+  - uses steps=50, guidance=7.5, fixed seed=42
+- **Theory**:
+  - CFG (classifier-free guidance) trades prompt adherence vs artifacts.
+
+</details>
+
+<details>
+<summary><b>Cell 043 (markdown)</b> — “OCR-based Evaluation” heading</summary>
+
+- **Purpose**: introduces OCR functions and readability metrics.
+
+</details>
+
+<details>
+<summary><b>Cell 044 (code)</b> — OCR + metric functions</summary>
+
+- **What it does**:
+  - preprocess image: grayscale → contrast → Otsu threshold
+  - run Tesseract OCR (`--psm 6`)
+  - metrics: exact match + character accuracy
+- **Theory**:
+  - thresholding improves separation of strokes vs background for OCR.
+
+</details>
+
+<details>
+<summary><b>Cell 045 (markdown)</b> — “Perform Evaluation” heading</summary>
+
+- **Purpose**: introduces evaluation loop across generated images.
+
+</details>
+
+<details>
+<summary><b>Cell 046 (code)</b> — Evaluate generated images + save CSV</summary>
+
+- **What it does**:
+  - loops through 10 generated images
+  - computes OCR text + exact match + char accuracy per sample
+  - prints per-sample results
+  - saves `./outputs/evaluation_results.csv`
+- **Theory**:
+  - exact match is strict; char accuracy captures partial correctness.
+
+</details>
+
+<details>
+<summary><b>Cell 047 (markdown)</b> — “Visualize Evaluation Results” heading</summary>
+
+- **Purpose**: introduces metric visualization and best/worst sample inspection.
+
+</details>
+
+<details>
+<summary><b>Cell 048 (code)</b> — Plot evaluation metrics</summary>
+
+- **What it does**:
+  - visualizes distribution and best/worst samples (as implemented in notebook)
+  - saves `./outputs/evaluation_metrics.png`
+
+</details>
+
+<details>
+<summary><b>Cell 049 (markdown)</b> — Section 7 heading (Results & Analysis)</summary>
+
+- **Purpose**: begins qualitative visualization and interpretation.
+
+</details>
+
+<details>
+<summary><b>Cell 050 (code)</b> — Visualize generated images with OCR overlays</summary>
+
+- **What it does**:
+  - shows generated image + ground truth + OCR text
+  - saves `./outputs/generated_images_with_ocr.png`
+- **Theory**:
+  - qualitative evidence complements OCR metrics (important when OCR is harsh).
+
+</details>
+
+<details>
+<summary><b>Cell 051 (markdown)</b> — “Compare Before and After Fine-tuning” heading</summary>
+
+- **Purpose**: introduces baseline comparison (base SD vs LoRA fine-tuned).
+
+</details>
+
+<details>
+<summary><b>Cell 052 (code)</b> — Load base model (without LoRA) for comparison</summary>
+
+- **What it does**:
+  - loads a base StableDiffusionPipeline without adapter weights
+  - generates baseline images for same prompts
+- **Theory**:
+  - comparison isolates the effect of LoRA fine-tuning.
+
+</details>
+
+<details>
+<summary><b>Cell 053 (code)</b> — Visualize base vs fine-tuned side-by-side</summary>
+
+- **What it does**:
+  - plots base outputs vs fine-tuned outputs
+  - saves `./outputs/before_after_comparison.png`
+- **What to look for**:
+  - improved text placement/clarity after fine-tuning.
+
+</details>
+
+<details>
+<summary><b>Cell 054 (markdown)</b> — “Qualitative Analysis” heading</summary>
+
+- **Purpose**: introduces written reasoning section (important for marks).
+
+</details>
+
+<details>
+<summary><b>Cell 055 (code)</b> — Print qualitative analysis</summary>
+
+- **What it does**:
+  - prints: model performance, domain adaptation, challenges, LoRA efficiency, applications
+- **Theory**:
+  - connects observed results to causes (data size, OCR sensitivity, diffusion behavior).
+
+</details>
+
+<details>
+<summary><b>Cell 056 (markdown)</b> — “Save Final Summary Report” heading</summary>
+
+- **Purpose**: introduces writing the final executive summary.
+
+</details>
+
+<details>
+<summary><b>Cell 057 (code)</b> — Create + save `summary_report.txt`</summary>
+
+- **What it does**:
+  - formats an executive report (metrics + config + loss)
+  - saves `./outputs/summary_report.txt`
+- **Why it matters**:
+  - professors can grade quickly using one file.
+
+</details>
+
+<details>
+<summary><b>Cell 058 (markdown)</b> — Section 8 heading (Conclusion)</summary>
+
+- **Purpose**: final wrap-up section of the assignment report.
+
+</details>
+
+<details>
+<summary><b>Cell 059 (code)</b> — Print “Project Completion Summary”</summary>
+
+- **What it does**:
+  - prints checklist of completed tasks
+  - prints paths to deliverables (weights, plots, CSV, report)
+- **Theory**:
+  - auditable output list supports exam-style submission quality.
+
+</details>
+
+<details>
+<summary><b>Cell 060 (markdown)</b> — Bonus: custom prompts heading</summary>
+
+- **Purpose**: optional extension to test generalization on new prompts.
+
+</details>
+
+<details>
+<summary><b>Cell 061 (code)</b> — Generate custom test images</summary>
+
+- **What it does**:
+  - generates images for custom prompts (not in validation set)
+  - saves `./outputs/custom_test_images.png`
+- **Theory**:
+  - shows whether the fine-tuned adapter generalizes beyond the tiny val set.
+
+</details>
+
+<details>
+<summary><b>Cell 062 (code)</b> — Print team member contributions</summary>
+
+- **Purpose**: documentation cell for group submissions (who did what).
+
+</details>
+
+<details>
+<summary><b>Cell 063 (code)</b> — Import datetime</summary>
+
+- **Purpose**: used for timestamps in reports (e.g., summary report generation time).
+
+</details>
+
+<details>
+<summary><b>Cell 064 (markdown)</b> — End of Assignment</summary>
+
+- **Purpose**: explicit end marker; useful when exporting PDF/printing.
+
+</details>
+
+> After these per-cell explanations, the next section continues with a more narrative (section-by-section) explanation for readability.
 
 ### A1. Title + Introduction
 
